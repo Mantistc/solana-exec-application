@@ -1,6 +1,4 @@
 use std::{
-    env,
-    io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -9,42 +7,54 @@ use std::{
 use iced::{
     color, executor,
     theme::Theme,
-    widget::{button, column, container, horizontal_space, row, text, text_editor, Container},
-    Application, Command, Element, Length, Settings,
+    widget::{button, column, container, row, text, text_input, Column, Image, Space},
+    Application, Command, Element, Settings, Subscription,
 };
-use rfd::AsyncFileDialog;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::{
-    native_token::LAMPORTS_PER_SOL,
-    signature::{read_keypair_file, Keypair},
-    signer::Signer,
-};
-use tokio::{fs::read_to_string, time};
+use solana_sdk::{native_token::LAMPORTS_PER_SOL, signature::Keypair};
+use tokio::time;
+mod errors;
+mod files;
+mod loaders;
+mod transaction;
+
+use errors::Error;
+use files::{default_file, pick_file, DEFAULT_LOCATION};
+use loaders::{display_balance, display_pubkey, load_keypair_from_file};
+use transaction::transfer_sol;
 
 fn main() -> iced::Result {
-    SolanaProgram::run(Settings::default())
+    SolExecApp::run(Settings::default())
 }
 
-struct SolanaProgram {
-    path: Option<PathBuf>,
-    content: text_editor::Content,
-    error: Option<Error>,
-    balance: Option<u64>,
+struct SolExecApp {
+    pub signer: Arc<Keypair>,
+    pub rpc_client: Arc<RpcClient>,
+    pub path: Option<PathBuf>,
+    pub error: Option<Error>,
+    pub balance: Option<u64>,
+    pub receiver_value: (String, String),
+    pub signature: String,
+    pub is_loading: bool,
+    pub current_frame: usize,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
-    FileOpened(Result<(PathBuf, Arc<String>), Error>),
+    FileOpened(Result<PathBuf, Error>),
     Open,
     BalanceLoaded(Result<u64, Error>),
     ErrorCleared,
+    TxValuesHandler((String, String)),
+    ExecuteTransaction,
+    TransactionExecuted(Result<String, Error>),
+    // for ./gif_animation/loader animation
+    NextFrame,
 }
-
-const DEFAULT_LOCATION: &str = ".config/solana/id.json";
 
 const RPC_URL: &str = "https://api.devnet.solana.com";
 
-impl Application for SolanaProgram {
+impl Application for SolExecApp {
     type Message = Message;
 
     type Executor = executor::Default;
@@ -56,12 +66,17 @@ impl Application for SolanaProgram {
     fn new(_flags: Self::Flags) -> (Self, Command<Message>) {
         (
             Self {
-                path: None,
-                content: text_editor::Content::new(),
+                path: Some(default_file()),
                 error: None,
                 balance: None,
+                rpc_client: Arc::new(RpcClient::new(RPC_URL.to_string())),
+                signer: Keypair::new().into(),
+                receiver_value: (String::new(), String::new()),
+                signature: String::new(),
+                is_loading: false,
+                current_frame: 0,
             },
-            Command::perform(load_file(default_file()), Message::FileOpened),
+            Command::perform(async { Ok(default_file()) }, Message::FileOpened),
         )
     }
 
@@ -71,10 +86,14 @@ impl Application for SolanaProgram {
 
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
-            Message::FileOpened(Ok((path, content))) => {
+            Message::Open => Command::perform(pick_file(), Message::FileOpened),
+            Message::FileOpened(Ok(path)) => {
                 self.path = Some(path.to_path_buf());
-                self.content = text_editor::Content::with(&content);
-                Command::perform(display_balance(path.to_path_buf()), Message::BalanceLoaded)
+                self.signer = load_keypair_from_file(path.to_path_buf()).into();
+                Command::perform(
+                    display_balance(path, self.rpc_client.clone()),
+                    Message::BalanceLoaded,
+                )
             }
             Message::FileOpened(Err(error)) => {
                 self.error = Some(error);
@@ -90,36 +109,140 @@ impl Application for SolanaProgram {
                 self.error = Some(error);
                 Command::none()
             }
-            Message::Open => Command::perform(pick_file(), Message::FileOpened),
+            Message::ExecuteTransaction => {
+                self.signature = String::new();
+                self.is_loading = true;
+                let values = SolExecApp {
+                    signer: Arc::clone(&self.signer),
+                    rpc_client: Arc::clone(&self.rpc_client),
+                    path: self.path.clone(),
+                    error: self.error.clone(),
+                    balance: self.balance.clone(),
+                    receiver_value: self.receiver_value.clone(),
+                    signature: self.signature.clone(),
+                    is_loading: self.is_loading,
+                    current_frame: self.current_frame,
+                };
+                Command::perform(transfer_sol(values), Message::TransactionExecuted)
+            }
+            Message::TransactionExecuted(Ok(signature)) => {
+                self.signature = signature;
+                let path = self
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| default_file().to_path_buf());
+                self.is_loading = false;
+                Command::perform(
+                    display_balance(path, self.rpc_client.clone()),
+                    Message::BalanceLoaded,
+                )
+            }
+            Message::TransactionExecuted(Err(error)) => {
+                self.error = Some(error);
+                self.is_loading = false;
+                Command::perform(async { time::sleep(Duration::from_secs(5)).await }, |_| {
+                    Message::ErrorCleared
+                })
+            }
+            Message::TxValuesHandler((address, amount)) => {
+                self.receiver_value = (address, amount);
+                Command::none()
+            }
             Message::ErrorCleared => {
                 self.error = None;
+                Command::none()
+            }
+            Message::NextFrame => {
+                self.current_frame = (self.current_frame + 1) % 21;
                 Command::none()
             }
         }
     }
 
-    fn view(&self) -> Element<'_, Message> {
-        let controls = row![button("Load keypair").on_press(Message::Open)];
+    fn subscription(&self) -> Subscription<Message> {
+        iced::time::every(Duration::from_millis(75)).map(|_| Message::NextFrame)
+    }
 
-        // get the file_path
+    fn view(&self) -> Element<'_, Message> {
+        let image_path = match self.current_frame {
+            0 => "./gif_animation/loader1.png",
+            1 => "./gif_animation/loader2.png",
+            2 => "./gif_animation/loader3.png",
+            3 => "./gif_animation/loader4.png",
+            4 => "./gif_animation/loader5.png",
+            5 => "./gif_animation/loader6.png",
+            6 => "./gif_animation/loader7.png",
+            7 => "./gif_animation/loader7.png",
+            8 => "./gif_animation/loader7.png",
+            9 => "./gif_animation/loader7.png",
+            10 => "./gif_animation/loader11.png",
+            11 => "./gif_animation/loader12.png",
+            12 => "./gif_animation/loader13.png",
+            13 => "./gif_animation/loader14.png",
+            14 => "./gif_animation/loader15.png",
+            15 => "./gif_animation/loader16.png",
+            16 => "./gif_animation/loader7.png",
+            17 => "./gif_animation/loader7.png",
+            18 => "./gif_animation/loader7.png",
+            19 => "./gif_animation/loader7.png",
+            20 => "./gif_animation/loader7.png",
+            _ => "./gif_animation/loader1.png",
+        };
+
+        let balance_text = match self.balance {
+            Some(balance) => column![
+                text("SOL Balance: ").style(color!(0x30cbf2)).size(14),
+                text(format!(" {:.3}", balance as f32 / LAMPORTS_PER_SOL as f32)).size(14)
+            ],
+            None => column![text("Loading balance...").size(14)],
+        };
+
         let file_path = self
             .path
             .as_deref()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from(""));
 
-        // display the publickey of the keypair
+        let file_path_indicator = text("Path of your keypair:")
+            .size(14)
+            .style(color!(0x30cbf2));
+        let file_path_name = text(file_path.to_str().unwrap_or(DEFAULT_LOCATION)).size(14);
+
+        let display_path = column![file_path_indicator, file_path_name];
+
         let display_pkey = display_pubkey(file_path.to_path_buf());
 
-        // display the SOL balance
-        let balance_text = match self.balance {
-            Some(balance) => row![
-                text("SOL Balance: ").style(color!(0x30cbf2)).size(14),
-                text(format!(" {:.3}", balance as f32 / LAMPORTS_PER_SOL as f32)).size(14)
-            ],
-            None => row![text("Loading balance...").size(14)],
+        // display the pubkey of the keypair & SOL balance
+
+        let wallet_info = row![display_pkey, balance_text].spacing(100);
+
+        let load_keypair = button("Load keypair").on_press(Message::Open);
+
+        // Solana sender
+
+        let some_h2 = Column::new().push(Space::with_height(20)).push(
+            text("Send SOL to any wallet!!! LFG")
+                .style(color!(0x30cbf2))
+                .size(14),
+        );
+
+        let address_input = text_input("Put receiver address", &self.receiver_value.0)
+            .on_input(|value| Message::TxValuesHandler((value, self.receiver_value.1.to_string())));
+
+        let amount_input = text_input("Lamports to send", &self.receiver_value.1.to_string())
+            .on_input(|value| Message::TxValuesHandler((self.receiver_value.0.clone(), value)));
+
+        let send_lamports_btn: Element<'_, Message> = if self.is_loading {
+            Image::new(image_path).width(64).height(40).into()
+        } else {
+            button("Send lamports")
+                .on_press(Message::ExecuteTransaction)
+                .into()
         };
 
+        let signature = text(&self.signature).size(14);
+
+        // if there's some error, display it
         let info_message = if let Some(ref error) = &self.error {
             text(format!("Error: {:?}", error))
                 .size(14)
@@ -128,21 +251,17 @@ impl Application for SolanaProgram {
             text("").size(1)
         };
 
-        let file_path_name = text(file_path.to_str().unwrap_or(DEFAULT_LOCATION)).size(14);
-        let file_path_indicator = text("Path of your keypair:")
-            .size(14)
-            .style(color!(0x30cbf2));
-
-        let status_bar = row![file_path_name, horizontal_space(Length::Fixed(100.0)),];
-
         container(
             column![
-                display_pkey,
-                balance_text,
-                file_path_indicator,
-                status_bar,
-                controls,
+                wallet_info,
+                display_path,
+                load_keypair,
                 info_message,
+                some_h2,
+                address_input,
+                amount_input,
+                send_lamports_btn,
+                signature
             ]
             .spacing(10),
         )
@@ -153,69 +272,4 @@ impl Application for SolanaProgram {
     fn theme(&self) -> Theme {
         Theme::Dark
     }
-}
-
-fn display_pubkey(file_path: PathBuf) -> Element<'static, Message> {
-    let keypair = load_keypair_from_file(file_path);
-
-    let public_key_display = text(format!("Wallet address: {}", keypair.pubkey().to_string()))
-        .size(14)
-        .width(Length::Fixed(400.0))
-        .height(Length::Shrink);
-
-    let pubkey_container = Container::new(public_key_display).width(Length::Fixed(400.0));
-    pubkey_container.into()
-}
-
-async fn display_balance(path: PathBuf) -> Result<u64, Error> {
-    let keypair = load_keypair_from_file(path);
-    let client = Arc::new(RpcClient::new(RPC_URL.to_string()));
-    client
-        .get_balance(&keypair.pubkey())
-        .await
-        .map_err(|_| Error::FetchBalanceError)
-}
-
-fn load_keypair_from_file(path: PathBuf) -> Keypair {
-    let keypair = read_keypair_file(path).unwrap_or(Keypair::new());
-    keypair
-}
-
-fn default_file() -> PathBuf {
-    let home_dir = env::var("HOME") // mac users
-        .or_else(|_| env::var("USERPROFILE")) // windows users
-        .expect("Cannot find home directory");
-    let mut path = PathBuf::from(home_dir);
-    path.push(DEFAULT_LOCATION);
-    path
-}
-
-async fn pick_file() -> Result<(PathBuf, Arc<String>), Error> {
-    let handle = AsyncFileDialog::new()
-        .set_title("Choose a valid json solana keypair")
-        .pick_file()
-        .await
-        .ok_or(Error::DialogClosed)?;
-
-    if handle.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
-        return Err(Error::InvalidFileType);
-    }
-    load_file(handle.path().to_owned()).await
-}
-
-async fn load_file(path: PathBuf) -> Result<(PathBuf, Arc<String>), Error> {
-    let contents = read_to_string(&path)
-        .await
-        .map(Arc::new)
-        .map_err(|err| err.kind())
-        .map_err(Error::IO)?;
-    Ok((path, contents))
-}
-
-#[derive(Debug, Clone)]
-enum Error {
-    DialogClosed,
-    IO(ErrorKind),
-    FetchBalanceError,
-    InvalidFileType,
 }
